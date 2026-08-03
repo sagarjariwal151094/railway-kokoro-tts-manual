@@ -1,15 +1,22 @@
 import os
 import io
-import base64
+import sys
+
+# 1. Force the writable temporary volume for huggingface & model data download layers
+os.environ["HF_HOME"] = "/tmp/huggingface"
+os.environ["XDG_CACHE_HOME"] = "/tmp/cache"
+
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
-from kokoro import KPipeline
 import soundfile as sf
+import numpy as np
 
-app = FastAPI()
+# Lazy initialize pipeline to allow the environment variables to set firmly first
+pipeline = None
 
-# 1. API Key Authentication Layer
+app = FastAPI(title="Railway Manual Kokoro API Engine")
+
 API_KEY_NAME = "Authorization"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 SECRET_TOKEN = os.environ.get("API_KEY", "your_fallback_token")
@@ -17,47 +24,52 @@ SECRET_TOKEN = os.environ.get("API_KEY", "your_fallback_token")
 def get_api_key(header_value: str = Depends(api_key_header)):
     if not header_value:
         raise HTTPException(status_code=401, detail="Missing Authorization Header")
-    # Clean up "Bearer <token>" formatting if sent that way
     token = header_value.replace("Bearer ", "").strip()
     if token != SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid API Token")
     return token
 
-# 2. Initialize the Kokoro Pipeline (Downloads weights dynamically on cold start)
-# 'a' stands for American English; adjust to 'b' for British if desired
-import os
-os.environ["HF_HOME"] = os.path.dirname(os.path.abspath(__file__))
-pipeline = KPipeline(lang_code='a')
+def get_pipeline():
+    global pipeline
+    if pipeline is None:
+        try:
+            from kokoro import KPipeline
+            # Downloads ~350MB model weights file into /tmp/ dynamically on first call
+            pipeline = KPipeline(lang_code='a')
+        except Exception as e:
+            raise RuntimeError(f"Failed initializing internal KPipeline backend: {str(e)}")
+    return pipeline
 
 class TTSRequest(BaseModel):
     input: str
     voice: str = "af_bella"
     speed: float = 1.0
 
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "kokoro-tts"}
+
 @app.post("/v1/audio/speech")
 async def generate_speech(request: TTSRequest, token: str = Depends(get_api_key)):
     try:
-        # Generate generator stream from Kokoro pipeline
-        generator = pipeline(request.input, voice=request.voice, speed=request.speed, split_pattern=r'\n+')
+        tts_pipeline = get_pipeline()
+        generator = tts_pipeline(request.input, voice=request.voice, speed=request.speed, split_pattern=r'\n+')
         
-        # Combine fragments into a single audio structure
         all_audio = []
         for _, _, audio in generator:
-            all_audio.append(audio)
+            if audio is not None:
+                all_audio.append(audio)
             
         if not all_audio:
-            raise HTTPException(status_code=400, detail="Could not synthesize text sequence.")
+            raise HTTPException(status_code=400, detail="Synthesizer processing returned empty data output stream.")
             
-        # Concatenate audio chunks safely
-        import numpy as np
         final_audio = np.concatenate(all_audio)
 
-        # Write audio track data structure directly to an in-memory buffer
+        # Write WAV stream natively into memory
         buffer = io.BytesIO()
-        sf.write(buffer, final_audio, 24000, format='WAV') # Native Kokoro output is 24kHz
+        sf.write(buffer, final_audio, 24000, format='WAV')
         buffer.seek(0)
         
-        # Return binary response stream
         from fastapi.responses import StreamingResponse
         return StreamingResponse(buffer, media_type="audio/wav")
 
