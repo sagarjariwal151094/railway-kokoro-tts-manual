@@ -25,6 +25,8 @@ def get_api_key(header_value: str = Depends(api_key_header)):
 
 # 2. Initialize the Kokoro Pipeline (Downloads weights dynamically on cold start)
 # 'a' stands for American English; adjust to 'b' for British if desired
+import os
+os.environ["HF_HOME"] = os.path.dirname(os.path.abspath(__file__))
 pipeline = KPipeline(lang_code='a')
 
 class TTSRequest(BaseModel):
